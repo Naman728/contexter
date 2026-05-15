@@ -30,3 +30,25 @@ assert tracker.aliases("pod-abc") == frozenset({"pod-abc", "pod-xyz"})
 pip install -e ".[dev]"
 pytest
 ```
+
+### P-02 organizer harness (`run.py`)
+
+The benchmark driver expects the official harness directory (files such as `harness.py`, `generator.py`, `schema.py`, `metrics.py`, `adapter.py`). The **contexter** repo root does not include those files, so either set `P02_BENCH` or pass `--bench` to that directory. From this repo root, after `pip install -e .`:
+
+```bash
+export P02_BENCH=/absolute/path/to/p02-harness-directory
+python run.py --adapter adapters.myteam:Engine --mode fast \
+  --seeds 9999 31415 27182 16180 11235 \
+  --n-services 20 --days 14 --out report.json
+```
+
+Same run without `export` (handy from the contexter directory):
+
+```bash
+python run.py --bench /absolute/path/to/p02-harness-directory \
+  --adapter adapters.myteam:Engine --mode fast \
+  --seeds 9999 31415 27182 16180 11235 \
+  --n-services 20 --days 14 --out report.json
+```
+
+If that harness tree is merged next to `run.py` so `harness.py` sits in the same directory, `P02_BENCH` is not required. The submission adapter is `adapters/myteam.py` (`Engine` class).

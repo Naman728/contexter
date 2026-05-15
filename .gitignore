@@ -24,6 +24,10 @@ htmlcov/
 .vscode/
 .DS_Store
 
+# P-02 harness output (local runs)
+report.json
+report_*seeds*.json
+
 # Secrets
 .env
 *.pem
