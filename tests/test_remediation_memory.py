@@ -43,7 +43,22 @@ class TestRemediationMemory:
             ("scale", 0.5),
         ]
 
-    def test_fingerprint_hashes_are_independent(self) -> None:
+    def test_top_actions_for_fingerprint_base_merges_extended_keys(self) -> None:
+        memory = RemediationMemory()
+        memory.record(
+            "error:api:1:cache,db:P0:0:dUfUrUcU:api:api:NA",
+            "rollback",
+            outcome="resolved",
+        )
+        memory.record(
+            "error:api:1:cache,db:P2_3:1:d0Uf0r0c0:db:api:abc123",
+            "rollback",
+            outcome="failed",
+        )
+        merged = memory.top_actions_for_fingerprint_base("error:api:1:cache,db", k=1)
+        assert merged[0][0] == "rollback"
+        assert merged[0][1] == pytest.approx(1.0 / 2.0)
+
         memory = RemediationMemory()
         memory.record("fp-a", "restart", outcome="resolved")
         memory.record("fp-b", "restart", outcome="failed")

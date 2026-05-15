@@ -12,6 +12,8 @@ from contexter.incident_fingerprint import (
     IncidentFingerprint,
     MatchResult,
     jaccard,
+    normalize_trigger,
+    partial_upstream_overlap,
     structural_similarity,
 )
 
@@ -51,6 +53,7 @@ class TestExtraction:
             "latency_spike",
             "gateway",
             frozenset({"auth", "catalog"}),
+            "gateway",
         )
 
     def test_extract_from_event(self) -> None:
@@ -88,8 +91,8 @@ class TestSimilarity:
     def test_partial_upstream_overlap(self) -> None:
         left = IncidentFingerprint("error_rate", "api", frozenset({"auth", "db"}))
         right = IncidentFingerprint("error_rate", "api", frozenset({"auth", "cache"}))
-        # trigger + role match (0.7) + jaccard 1/3 * 0.3
-        assert structural_similarity(left, right) == pytest.approx(0.7 + 0.1)
+        # max(Jaccard, partial) boosts upstream vs strict Jaccard-only scoring
+        assert structural_similarity(left, right) == pytest.approx(0.85)
 
     def test_jaccard_empty_sets(self) -> None:
         assert jaccard(frozenset(), frozenset()) == 1.0
@@ -141,3 +144,153 @@ class TestTopK:
         assert matcher.best_match(
             IncidentFingerprint("x", "y", frozenset())
         ) is None
+
+
+class TestTriggerNormalization:
+    def test_latency_family_groups_p99_and_p95(self) -> None:
+        assert normalize_trigger("latency_p99_ms") == normalize_trigger("latency_p95_ms")
+        assert normalize_trigger("latency_p99_ms") == "latency"
+
+    def test_error_family_groups_rate_and_timeout(self) -> None:
+        assert normalize_trigger("5xx_rate") == normalize_trigger("error_rate")
+        assert normalize_trigger("timeout_rate") == "error"
+
+
+class TestRecallEnhancements:
+    def test_partial_upstream_overlap_exceeds_jaccard_on_subset(self) -> None:
+        a = frozenset({"auth", "db"})
+        b = frozenset({"auth", "db", "cache", "cdn", "edge"})
+        assert partial_upstream_overlap(a, b) > jaccard(a, b)
+
+    def test_debug_returns_score_breakdown(self) -> None:
+        left = IncidentFingerprint("error_rate", "api", frozenset({"auth"}))
+        right = IncidentFingerprint("timeout_rate", "api", frozenset({"auth"}))
+        bd = structural_similarity(left, right, debug=True)
+        assert isinstance(bd, dict)
+        assert set(bd.keys()) == {
+            "trigger_score",
+            "upstream_score",
+            "role_score",
+            "temporal_score",
+            "alias_score",
+            "role_family_score",
+            "final",
+        }
+        assert bd["trigger_score"] == 1.0
+        assert bd["final"] == pytest.approx(1.0)
+
+    def test_temporal_boost_same_deploy_window(self) -> None:
+        left = IncidentFingerprint("error_rate", "api", frozenset({"db"}))
+        right = IncidentFingerprint("error_rate", "api", frozenset({"db"}))
+        qctx = {"deploy_window": 42}
+        cctx = {"deploy_window": 42}
+        bd = structural_similarity(
+            left, right, query_context=qctx, candidate_context=cctx, debug=True
+        )
+        assert bd["temporal_score"] == pytest.approx(0.15)
+        assert bd["final"] == pytest.approx(1.0)
+
+    def test_top_k_debug_includes_breakdown(self) -> None:
+        matcher = FingerprintMatcher()
+        matcher.index("p", IncidentFingerprint("error_rate", "api", frozenset({"db"})))
+        rows = matcher.top_k(
+            IncidentFingerprint("timeout_rate", "api", frozenset({"db"})),
+            k=1,
+            debug=True,
+        )
+        assert rows[0].score_breakdown is not None
+        assert rows[0].score_breakdown["trigger_score"] == 1.0
+
+    def test_noisy_upstream_still_retrieves_family(self) -> None:
+        matcher = FingerprintMatcher()
+        matcher.index_incident(
+            "past-family",
+            {
+                "trigger_type": "error_rate",
+                "service": "checkout-api",
+                "upstream": ["auth", "payments"],
+            },
+        )
+        matcher.index_incident(
+            "distractor",
+            {
+                "trigger_type": "error_rate",
+                "service": "unrelated-svc",
+                "upstream": ["cache", "cdn"],
+            },
+        )
+        matches = matcher.top_k(
+            {
+                "trigger_type": "5xx_rate",
+                "service": "checkout-api",
+                "upstream": ["auth", "payments", "telemetry", "feature-flags", "cdn"],
+            },
+            k=2,
+        )
+        assert matches[0].incident_id == "past-family"
+        assert matches[0].score >= matches[1].score
+
+    def test_renamed_services_score_high_via_identity(self) -> None:
+        identity = IdentityTracker()
+        identity.union("orders-api", "fulfillment-api")
+        matcher = FingerprintMatcher(FingerprintExtractor(identity))
+        matcher.index_incident(
+            "past",
+            {
+                "trigger_type": "latency_p99_ms",
+                "service": "orders-api",
+                "upstream": ["db-primary"],
+            },
+        )
+        matches = matcher.top_k(
+            {
+                "trigger_type": "latency_p95_ms",
+                "service": "fulfillment-api",
+                "upstream": ["db-primary"],
+            },
+            k=1,
+        )
+        assert matches[0].incident_id == "past"
+        assert matches[0].score >= 0.99
+
+    def test_role_family_boost_when_role_strings_differ(self) -> None:
+        left = IncidentFingerprint(
+            "error_rate",
+            "payments-api",
+            frozenset(),
+            "payments-api",
+        )
+        right = IncidentFingerprint(
+            "error_rate",
+            "payments-svc",
+            frozenset(),
+            "payments-svc",
+        )
+        bd = structural_similarity(left, right, debug=True)
+        assert bd["role_score"] == 0.0
+        assert bd["role_family_score"] == pytest.approx(0.10)
+        assert bd["final"] > 0.4
+
+    def test_top_k_mean_latency_stays_low(self) -> None:
+        import time
+
+        matcher = FingerprintMatcher()
+        for i in range(400):
+            matcher.index(
+                str(i),
+                IncidentFingerprint(
+                    "error_rate",
+                    "api",
+                    frozenset({str(j % 11) for j in range(i % 12)}),
+                ),
+            )
+        q = {
+            "trigger_type": "timeout_rate",
+            "service": "api",
+            "upstream": ["1", "2", "3"],
+        }
+        t0 = time.perf_counter()
+        for _ in range(40):
+            matcher.top_k(q, k=5)
+        ms = (time.perf_counter() - t0) / 40 * 1000.0
+        assert ms < 8.0, f"mean top_k latency {ms:.2f}ms exceeds budget"

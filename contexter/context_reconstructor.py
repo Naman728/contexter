@@ -9,9 +9,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypedDict
 
 from contexter.causal_graph import CausalEdge, CausalGraph
-from contexter.incident_fingerprint import FingerprintMatcher, MatchResult
+from contexter.incident_fingerprint import (
+    FingerprintMatcher,
+    IncidentFingerprint,
+    MatchResult,
+    RerankContext,
+    compute_retrieval_features,
+    fingerprint_remediation_base_key,
+)
+from contexter.incident_neighborhood_memory import IncidentNeighborhoodMemory
 from contexter.memory_substrate import MemorySubstrate
 from contexter.remediation_memory import RemediationMemory
+from contexter.retrieval_adaptation import RetrievalAdaptation
 from contexter.safe_context import (
     clamp_confidence,
     coerce_signal,
@@ -52,9 +61,11 @@ class ContextReconstructor:
     """Assembles a unified ``Context`` for an incident signal."""
 
     __slots__ = (
+        "_adaptation",
         "_causal_graph",
         "_claude_api_key",
         "_fingerprint_matcher",
+        "_neighborhood_memory",
         "_remediation_memory",
         "_substrate",
     )
@@ -66,12 +77,16 @@ class ContextReconstructor:
         fingerprint_matcher: FingerprintMatcher,
         remediation_memory: RemediationMemory,
         *,
+        neighborhood_memory: IncidentNeighborhoodMemory | None = None,
+        retrieval_adaptation: RetrievalAdaptation | None = None,
         claude_api_key: str | None = None,
     ) -> None:
         self._substrate = substrate
         self._causal_graph = causal_graph
         self._fingerprint_matcher = fingerprint_matcher
         self._remediation_memory = remediation_memory
+        self._neighborhood_memory = neighborhood_memory
+        self._adaptation = retrieval_adaptation or RetrievalAdaptation()
         self._claude_api_key = claude_api_key
 
     def reconstruct(
@@ -102,7 +117,11 @@ class ContextReconstructor:
         causal_chain = self._causal_chain(incident_id)
         query_fp = self._fingerprint_matcher._extractor.extract(safe_signal)
         similar_past_incidents = self._similar_incidents(
-            safe_signal, query_fp, exclude_incident_id=incident_id
+            safe_signal,
+            query_fp,
+            canonical=canonical,
+            signal_ts=signal_ts,
+            exclude_incident_id=incident_id,
         )
         suggested_remediations = self._suggested_remediations(
             canonical, query_fp
@@ -175,12 +194,46 @@ class ContextReconstructor:
         signal: dict[str, Any],
         query_fp: Any,
         *,
+        canonical: str,
+        signal_ts: datetime,
         exclude_incident_id: str | None,
     ) -> list[IncidentMatch]:
+        incident_id = str(signal.get("incident_id", "unknown"))
+        try:
+            edges = self._causal_graph.edges_for_incident(incident_id)
+        except Exception:
+            edges = []
+        query_features = compute_retrieval_features(
+            query_fp,
+            edges,
+            self._substrate,
+            canonical,
+            signal_ts,
+        )
+        rerank = RerankContext(
+            query_features=query_features,
+            remediation_memory=self._remediation_memory,
+            identity=self._substrate.identity,
+            dependency_graph=self._causal_graph.dependency_graph,
+            neighborhood_memory=self._neighborhood_memory,
+            query_canonical=canonical,
+            rerank_weights=dict(self._adaptation.weight_map()),
+            query_signal=signal,
+        )
         matches = self._fingerprint_matcher.top_k(
             signal,
             k=_MAX_SIMILAR,
             exclude_incident_id=exclude_incident_id,
+            rerank_context=rerank,
+        )
+        self._adaptation.record_retrieval(
+            signal=signal,
+            query_fp=query_fp,
+            query_features=query_features,
+            canonical_service=canonical,
+            matches=matches,
+            matcher=self._fingerprint_matcher,
+            rerank_ctx=rerank,
         )
         results: list[IncidentMatch] = []
         for match in matches[:_MAX_SIMILAR]:
@@ -202,11 +255,16 @@ class ContextReconstructor:
 
         best_by_action: dict[str, float] = {}
         rollback_conf = 0.0
-        upstream_flag = bool(query_fp.upstream_involved)
         for role in role_names:
-            fp_hash = f"{query_fp.trigger_type}:{role}:{upstream_flag}"
-            for action, action_confidence in self._remediation_memory.top_actions(
-                fp_hash, k=3
+            syn = IncidentFingerprint(
+                query_fp.trigger_type,
+                role,
+                query_fp.upstream_involved,
+                query_fp.canonical_affected or role,
+            )
+            base = fingerprint_remediation_base_key(syn)
+            for action, action_confidence in self._remediation_memory.top_actions_for_fingerprint_base(
+                base, k=3
             ):
                 prior = best_by_action.get(action, -1.0)
                 if action_confidence > prior:
@@ -363,7 +421,14 @@ def _fast_explain_template(
         action = "unknown"
         conf = 0.0
 
+    propagation = _propagation_narrative(causal_chain, service)
+    lead = (
+        f"{propagation} "
+        if propagation
+        else ""
+    )
     return (
+        f"{lead}"
         f"At {ts.isoformat()}, {service} triggered {trigger_type}. "
         f"{len(causal_chain)} causal edges found. "
         f"Closest past incident: {past_id} (similarity {sim:.0%}). "
@@ -392,6 +457,44 @@ def _context_summary(
     )
 
 
+def _propagation_narrative(
+    causal_chain: list[CausalEdge],
+    incident_service: str,
+) -> str:
+    prop = [
+        e
+        for e in causal_chain
+        if any(str(x).startswith("propagation:") for x in e.evidence)
+    ]
+    if not prop:
+        return ""
+    prop.sort(key=lambda e: e.occurred_at)
+    ordered: list[str] = []
+    for edge in prop:
+        if not ordered:
+            ordered.append(edge.cause_service)
+        ordered.append(edge.effect_service)
+    slim: list[str] = []
+    for name in ordered:
+        if name and (not slim or slim[-1] != name):
+            slim.append(name)
+    if not slim:
+        return ""
+    root = slim[0]
+    leaf = slim[-1]
+    if len(slim) <= 2:
+        return (
+            f"{root} degradation propagated into {leaf} causing "
+            f"{incident_service} failures."
+        )
+    mid = slim[1:-1]
+    hop_txt = " through ".join(mid)
+    return (
+        f"{root} degradation propagated through {hop_txt} into {leaf} causing "
+        f"{incident_service} failures."
+    )
+
+
 def _edge_to_dict(edge: CausalEdge) -> dict[str, Any]:
     return {
         "cause_id": edge.cause_id,
@@ -399,6 +502,8 @@ def _edge_to_dict(edge: CausalEdge) -> dict[str, Any]:
         "evidence": edge.evidence,
         "confidence": edge.confidence,
         "occurred_at": edge.occurred_at.isoformat(),
+        "cause_service": edge.cause_service,
+        "effect_service": edge.effect_service,
     }
 
 

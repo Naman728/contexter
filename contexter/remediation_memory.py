@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 from dataclasses import dataclass
 
 
@@ -73,3 +75,30 @@ class RemediationMemory:
             scored.append((action, stats.confidence))
         scored.sort(key=lambda row: row[1], reverse=True)
         return scored[:k]
+
+    def top_actions_for_fingerprint_base(
+        self,
+        base_key: str,
+        *,
+        k: int = 3,
+    ) -> list[tuple[str, float]]:
+        """Merge actions across extended hashes that share the same structural ``base_key``."""
+        prefix = base_key + ":"
+        by_action: dict[str, list[RemedStats]] = defaultdict(list)
+        for (fp_hash, action), stats in self._stats.items():
+            if fp_hash == base_key or fp_hash.startswith(prefix):
+                by_action[action].append(stats)
+        scored: list[tuple[str, float]] = []
+        for action, lst in by_action.items():
+            att = sum(s.attempts for s in lst)
+            suc = sum(s.successes for s in lst)
+            conf = suc / att if att else 0.0
+            scored.append((action, conf))
+        scored.sort(key=lambda row: row[1], reverse=True)
+        return scored[:k]
+
+    def action_keys_for_hash(self, fingerprint_hash: str) -> frozenset[str]:
+        """Distinct remediation actions ever recorded for ``fingerprint_hash``."""
+        return frozenset(
+            action for (fp_hash, action) in self._stats if fp_hash == fingerprint_hash
+        )

@@ -3,7 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Final
+
+
+@dataclass(frozen=True, slots=True)
+class AliasProfile:
+    """Topology snapshot for one canonical identity group."""
+
+    canonical: str
+    aliases: frozenset[str]
+    rename_depth: int
+    rename_timestamps: tuple[datetime, ...]
 
 
 class IdentityTracker:
@@ -14,12 +26,13 @@ class IdentityTracker:
     of ``new`` becomes the canonical root (topology drift semantics).
     """
 
-    __slots__ = ("_parent", "_size", "_aliases")
+    __slots__ = ("_aliases", "_drift_ts", "_parent", "_size")
 
     def __init__(self, names: Iterable[str] | None = None) -> None:
         self._parent: dict[str, str] = {}
         self._size: dict[str, int] = {}
         self._aliases: dict[str, set[str]] = {}
+        self._drift_ts: dict[str, list[datetime]] = {}
         if names is not None:
             for name in names:
                 self.register(name)
@@ -33,7 +46,13 @@ class IdentityTracker:
         """Return the canonical representative for ``name``."""
         return self._find(name)
 
-    def union(self, old: str, new: str) -> str:
+    def union(
+        self,
+        old: str,
+        new: str,
+        *,
+        occurred_at: datetime | None = None,
+    ) -> str:
         """Merge the identity of ``old`` into ``new``. Returns the canonical root."""
         self._ensure(old)
         self._ensure(new)
@@ -44,17 +63,25 @@ class IdentityTracker:
         if root_old == root_new:
             return root_old
 
+        winner: str
         if self._size[root_old] < self._size[root_new]:
             self._attach(root_old, root_new)
-            return root_new
-
-        if self._size[root_old] > self._size[root_new]:
+            winner = root_new
+        elif self._size[root_old] > self._size[root_new]:
             self._attach(root_new, root_old)
-            return root_old
+            winner = root_old
+        else:
+            self._attach(root_old, root_new)
+            winner = root_new
 
-        # Equal size: prefer ``new`` as canonical (drift: old -> new).
-        self._attach(root_old, root_new)
-        return root_new
+        if occurred_at is not None:
+            ts = (
+                occurred_at
+                if occurred_at.tzinfo is not None
+                else occurred_at.replace(tzinfo=timezone.utc)
+            )
+            self._drift_ts.setdefault(winner, []).append(ts)
+        return winner
 
     def aliases(self, name: str) -> frozenset[str]:
         """All names equivalent to ``name`` (including the canonical root)."""
@@ -70,6 +97,18 @@ class IdentityTracker:
     def canonical(self, name: str) -> str:
         """Alias for :meth:`resolve`."""
         return self.resolve(name)
+
+    def alias_profile(self, name: str) -> AliasProfile:
+        """Return alias history and drift timestamps for ``name``'s identity group."""
+        self._ensure(name)
+        root = self._find(name)
+        ts_list = self._drift_ts.get(root, ())
+        return AliasProfile(
+            canonical=root,
+            aliases=frozenset(self._aliases[root]),
+            rename_depth=len(ts_list),
+            rename_timestamps=tuple(ts_list),
+        )
 
     def groups(self) -> Iterator[frozenset[str]]:
         """Yield each disjoint identity group."""
@@ -103,3 +142,6 @@ class IdentityTracker:
         self._parent[child_root] = parent_root
         self._size[parent_root] += self._size[child_root]
         self._aliases[parent_root] |= self._aliases.pop(child_root)
+        child_hist = self._drift_ts.pop(child_root, [])
+        if child_hist:
+            self._drift_ts.setdefault(parent_root, []).extend(child_hist)

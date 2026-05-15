@@ -9,7 +9,11 @@ import pytest
 from contexter.causal_graph import CausalGraph
 from contexter.context_reconstructor import Context, ContextReconstructor
 from contexter.identity_tracker import IdentityTracker
-from contexter.incident_fingerprint import FingerprintExtractor, FingerprintMatcher
+from contexter.incident_fingerprint import (
+    FingerprintExtractor,
+    FingerprintMatcher,
+    fingerprint_remediation_base_key,
+)
 from contexter.memory_substrate import MemorySubstrate
 from contexter.remediation_memory import RemediationMemory
 
@@ -91,7 +95,7 @@ class TestFastMode:
                 "upstream": [],
             }
         )
-        fp_hash = f"{fp.trigger_type}:{fp.affected_role}:{bool(fp.upstream_involved)}"
+        fp_hash = fingerprint_remediation_base_key(fp)
         remediation.record(fp_hash, "restart", outcome="resolved")
 
         context = reconstructor.reconstruct(

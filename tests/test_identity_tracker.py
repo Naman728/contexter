@@ -77,6 +77,23 @@ class TestAliases:
         tracker.union("n2", "n3")
         assert tracker.aliases("n1") == frozenset({"n1", "n2", "n3", "n4"})
 
+    def test_alias_profile_tracks_renames(self) -> None:
+        from datetime import datetime, timezone
+
+        from contexter.identity_tracker import AliasProfile
+
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        t1 = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        tracker = IdentityTracker(["a", "b", "c"])
+        tracker.union("a", "b", occurred_at=t0)
+        tracker.union("c", "b", occurred_at=t1)
+        prof = tracker.alias_profile("a")
+        assert isinstance(prof, AliasProfile)
+        assert prof.canonical == "b"
+        assert prof.rename_depth == 2
+        assert prof.aliases == frozenset({"a", "b", "c"})
+        assert len(prof.rename_timestamps) == 2
+
     def test_groups_iterator(self) -> None:
         tracker = IdentityTracker(["a", "b", "c", "d"])
         tracker.union("a", "b")

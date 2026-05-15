@@ -174,6 +174,32 @@ class MemorySubstrate:
         )
         return [self._row_to_dict(row) for row in rows]
 
+    def last_deploy_before(
+        self,
+        service: str,
+        until: datetime,
+    ) -> datetime | None:
+        """Most recent deploy on the resolved canonical service at or before ``until``."""
+        if not service:
+            return None
+        self._identity.register(service)
+        canonical = self._identity.resolve(service)
+        rows = self.query(
+            """
+            SELECT occurred_at
+            FROM events
+            WHERE canonical_service = ?
+              AND kind = 'deploy'
+              AND occurred_at <= ?
+            ORDER BY occurred_at DESC
+            LIMIT 1
+            """,
+            [canonical, until],
+        )
+        if not rows:
+            return None
+        return rows[0][0]
+
     def close(self) -> None:
         self.flush()
         self._conn.close()
@@ -198,7 +224,11 @@ class MemorySubstrate:
             fallback = event.service or "unknown"
             self._identity.register(fallback)
             return self._identity.resolve(fallback)
-        self._identity.union(str(old), str(new))
+        self._identity.union(
+            str(old),
+            str(new),
+            occurred_at=event.occurred_at_utc(),
+        )
         return self._identity.resolve(str(new))
 
     def _dispatch(self, event: Event, canonical: str) -> None:
