@@ -6,6 +6,7 @@ import hashlib
 import heapq
 import math
 import os
+import statistics
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -1057,6 +1058,17 @@ _DEFAULT_RERANK_WEIGHTS: dict[str, float] = {
 # Rerank sensitivity / separation (FingerprintMatcher): widen structural vs generic mass.
 _RERANK_PROP_SENSITIVITY = 1.2
 _RERANK_UPSTREAM_SENSITIVITY = 1.15
+# Recall: edge/causal propagation mass prior (before depth-aware clipping).
+_RERANK_PROP_RECALL_PRIOR = 1.25
+# Pool rerank: margin vs leave-one-out mean, order-statistic boost, hinge, then softmax(T).
+_POOL_MARGIN_ALPHA = 0.2
+_POOL_SOFTMAX_TEMP = 0.7
+_POOL_ORDER_STAT_SIGMA_MULT = 1.5
+_POOL_ORDER_STAT_BOOST = 1.05
+_POOL_HINGE_GAP = 0.1
+_POOL_HINGE_GAIN = 0.3
+# Leave-one-out margin / hinge can invert tiny pools; apply only when diverse enough.
+_POOL_MARGIN_MIN_CANDIDATES = 8
 _RERANK_SCORE_SHARPEN_EXP = 1.05
 _RERANK_TRIGGER_IDF_MASS_FLOOR = 0.90
 _RERANK_TRIGGER_IDF_MASS_CAP = 1.08
@@ -1117,6 +1129,10 @@ def rerank_component_values(
     Trigger mass is capped (``_RERANK_TRIGGER_SCORE_CAP``), halved when raw trigger IDF
     is below :data:`_RERANK_TRIGGER_RAW_IDF_HALF_THRESHOLD`, and zeroed when corpus IDF
     is available and neither propagation nor upstream exceeds :data:`_RERANK_TRIGGER_STRUCT_GATE`.
+
+    Propagation edge/causal mass is scaled by :data:`_RERANK_PROP_RECALL_PRIOR` for recall.
+    When both sides have propagation depth ≥ 2, propagation and upstream skip ``min(1, …)``
+    clipping after corpus sensitivity scaling (large corpora only).
     """
     trigger = 1.0 if qfeat.norm_trigger == cfeat.norm_trigger else 0.0
     if qfp.affected_role == cfp.affected_role:
@@ -1135,6 +1151,7 @@ def rerank_component_values(
     causal_sim = 1.0 - abs(cq - cc) / max(cq, cc, 1)
     propagation = 0.5 * prop_sim + 0.5 * causal_sim
     temporal = deploy_sim
+    propagation = float(propagation) * _RERANK_PROP_RECALL_PRIOR
 
     remed = _remediation_similarity(
         ctx.remediation_memory, qfeat.remediation_fp_hash, cfeat.remediation_fp_hash
@@ -1146,9 +1163,21 @@ def rerank_component_values(
         tm = _rerank_trigger_idf_mass_multiplier(idf_stats, cfeat.norm_trigger)
         trigger = max(0.0, min(1.0, float(trigger) * float(tm)))
     nd = int(idf_stats.total_docs) if idf_stats is not None else 0
+    qd = int(qfeat.propagation_fingerprint.propagation_depth)
+    cd = int(cfeat.propagation_fingerprint.propagation_depth)
+    structural_deep = min(qd, cd) >= 2
     if nd >= _RERANK_FULL_SENSITIVITY_MIN_DOCS:
-        propagation = min(1.0, float(propagation) * _RERANK_PROP_SENSITIVITY)
-        upstream = min(1.0, float(upstream) * _RERANK_UPSTREAM_SENSITIVITY)
+        p_lin = float(propagation) * _RERANK_PROP_SENSITIVITY
+        u_lin = float(upstream) * _RERANK_UPSTREAM_SENSITIVITY
+        if structural_deep:
+            propagation = p_lin
+            upstream = u_lin
+        else:
+            propagation = min(1.0, p_lin)
+            upstream = min(1.0, u_lin)
+    else:
+        if not structural_deep:
+            propagation = min(1.0, float(propagation))
     trigger = max(0.0, min(_RERANK_TRIGGER_SCORE_CAP, float(trigger)))
     if idf_stats is not None and idf_stats.total_docs > 0:
         n_doc = int(idf_stats.total_docs)
@@ -1776,6 +1805,53 @@ def _rerank_introspection(
         false_positive_suppress_multiplier=fp_sup,
         separation_sharpen=separation_sharpen,
     )
+
+
+def _pool_margin_adjust_scores(scores: Sequence[float]) -> list[float]:
+    """Leave-one-out margin, order-statistic boost, hinge (label-free FP proxy)."""
+    s = [float(x) for x in scores]
+    n = len(s)
+    if n == 0:
+        return []
+    if n == 1:
+        return [s[0]]
+    total = sum(s)
+    for i in range(n):
+        mean_other = (total - s[i]) / (n - 1)
+        s[i] += _POOL_MARGIN_ALPHA * (s[i] - mean_other)
+    mu = statistics.mean(s)
+    sigma = statistics.pstdev(s)
+    thr = mu + _POOL_ORDER_STAT_SIGMA_MULT * sigma
+    for i in range(n):
+        if s[i] > thr:
+            s[i] *= _POOL_ORDER_STAT_BOOST
+    for i in range(n):
+        best_other = max(s[j] for j in range(n) if j != i)
+        hinge = max(0.0, _POOL_HINGE_GAP - (s[i] - best_other))
+        s[i] += _POOL_HINGE_GAIN * hinge
+    return s
+
+
+def _pool_softmax_probs(values: Sequence[float], *, T: float) -> list[float]:
+    """Numerically stable softmax(values / T), probabilities sum to 1."""
+    xs = [float(x) for x in values]
+    n = len(xs)
+    if n == 0:
+        return []
+    if n == 1:
+        v = xs[0]
+        return [min(1.0, max(0.0, v))]
+    mx = max(xs)
+    T_eff = max(T, 1e-9)
+    logits = [(x - mx) / T_eff for x in xs]
+    exps: list[float] = []
+    for li in logits:
+        li = max(-40.0, min(40.0, li))
+        exps.append(math.exp(li))
+    zsum = sum(exps)
+    if zsum <= 0.0:
+        return [1.0 / n] * n
+    return [e / zsum for e in exps]
 
 
 def _apply_margin_rank_calibration(
@@ -3081,24 +3157,27 @@ class FingerprintMatcher:
         nd_pool = int(rctx_score.idf_stats.total_docs) if rctx_score.idf_stats else 0
         if len(reranked) >= 6 and nd_pool >= 20:
             reranked = _apply_reranked_fp_penalties(reranked, feat_by_iid)
-        scores = [row[0] for row in reranked]
-        rarity = [row[3].rarity_factor for row in reranked]
-        gen_mult = [row[3].generic_feature_multiplier for row in reranked]
-        adjusted, _margin_deltas = _apply_margin_rank_calibration(scores, rarity, gen_mult)
+        raw_after_penalties = [float(row[0]) for row in reranked]
+        if len(raw_after_penalties) >= _POOL_MARGIN_MIN_CANDIDATES:
+            margin_adj = _pool_margin_adjust_scores(raw_after_penalties)
+        else:
+            margin_adj = list(raw_after_penalties)
+        pool_probs = _pool_softmax_probs(margin_adj, T=_POOL_SOFTMAX_TEMP)
         calibrated: list[
             tuple[float, str, IncidentFingerprint, RerankIntrospection, dict[str, float] | None, tuple[str, ...]]
         ] = []
-        for row, adj in zip(reranked, adjusted):
+        for row, raw_s, adj_s, s_soft in zip(reranked, raw_after_penalties, margin_adj, pool_probs):
             score, incident_id, fp, intro, bd, tags = row
-            clip = min(1.0, adj)
-            nintro = replace(intro, total_score=clip, margin_calibration_delta=clip - score)
+            clip = min(1.0, max(0.0, s_soft))
+            nintro = replace(intro, total_score=clip, margin_calibration_delta=clip - raw_s)
             if bd is not None:
                 bd = {
                     **bd,
                     "rerank_score": clip,
                     "rerank_decomposition": nintro.as_public_dict(incident_id),
                 }
-            calibrated.append((adj, incident_id, fp, nintro, bd, tags))
+            # Primary: raw rerank (structural truth); tie-break: margin-adjusted mass.
+            calibrated.append(((raw_s, adj_s), incident_id, fp, nintro, bd, tags))
 
         calibrated.sort(
             key=lambda row: (
@@ -3120,7 +3199,7 @@ class FingerprintMatcher:
             reverse=True,
         )
         self._last_ranking_calib_stats = (
-            _ranking_spread_diagnostics([min(1.0, row[0]) for row in calibrated])
+            _ranking_spread_diagnostics([min(1.0, float(row[0][0])) for row in calibrated])
             if calibrated
             else None
         )
@@ -3158,7 +3237,7 @@ class FingerprintMatcher:
                 score_breakdown=bd,
                 retrieval_sources=tags,
             )
-            for _adj, incident_id, fp, nintro, bd, tags in best
+            for _pk, incident_id, fp, nintro, bd, tags in best
         ]
 
         topk_ok = _top_k_has_same_family(fingerprint, results)
