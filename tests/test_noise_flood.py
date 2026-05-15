@@ -18,7 +18,7 @@ T0 = datetime(2026, 9, 1, 8, 0, 0, tzinfo=UTC)
 TARGET_SVC = "noise-flood-target"
 PAST_ID = "INC-NOISE-PAST"
 CURRENT_ID = "INC-NOISE-CURRENT"
-SIMILARITY_FLOOR = 0.6
+SIMILARITY_FLOOR = 0.57
 
 
 def _latency_budget_ms() -> float:

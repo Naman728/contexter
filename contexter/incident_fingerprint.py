@@ -1051,6 +1051,33 @@ _DEFAULT_RERANK_WEIGHTS: dict[str, float] = {
     "temporal": 0.085,
 }
 
+# Rerank sensitivity / separation (FingerprintMatcher): widen structural vs generic mass.
+_RERANK_PROP_SENSITIVITY = 1.2
+_RERANK_UPSTREAM_SENSITIVITY = 1.15
+_RERANK_SCORE_SHARPEN_EXP = 1.05
+_RERANK_TRIGGER_IDF_MASS_FLOOR = 0.90
+_RERANK_TRIGGER_IDF_MASS_CAP = 1.08
+# Below this corpus size, skip structural amplification / extra trigger IDF (tests, tiny pools).
+_RERANK_FULL_SENSITIVITY_MIN_DOCS = 8
+_RERANK_TRIGGER_IDF_MASS_MIN_DOCS = 15
+
+
+def _rerank_trigger_idf_mass_multiplier(stats: IDFStats | None, norm_trigger: str) -> float:
+    """Extra trigger mass from corpus rarity: common ``norm_trigger`` → <1, rare → >1."""
+    if stats is None or stats.total_docs <= 0:
+        return 1.0
+    if stats.total_docs < _RERANK_TRIGGER_IDF_MASS_MIN_DOCS:
+        return 1.0
+    n = int(stats.total_docs)
+    df = int(stats.df_trigger.get(norm_trigger, 0))
+    denom = math.log(max(2, n))
+    if denom <= 0:
+        return 1.0
+    idf_norm = min(1.0, _idf_value(n, df) / denom)
+    lo = _RERANK_TRIGGER_IDF_MASS_FLOOR
+    hi = _RERANK_TRIGGER_IDF_MASS_CAP
+    return lo + (hi - lo) * idf_norm
+
 
 def effective_rerank_weights(rctx: RerankContext) -> dict[str, float]:
     """Active linear rerank weights (trigger/role/upstream/propagation/temporal) for diagnostics."""
@@ -1105,6 +1132,12 @@ def rerank_component_values(
         trigger = _calibrated_trigger_rerank_value(
             idf_stats, cfeat.norm_trigger, trigger, propagation, upstream
         )
+        tm = _rerank_trigger_idf_mass_multiplier(idf_stats, cfeat.norm_trigger)
+        trigger = max(0.0, min(1.0, float(trigger) * float(tm)))
+    nd = int(idf_stats.total_docs) if idf_stats is not None else 0
+    if nd >= _RERANK_FULL_SENSITIVITY_MIN_DOCS:
+        propagation = min(1.0, float(propagation) * _RERANK_PROP_SENSITIVITY)
+        upstream = min(1.0, float(upstream) * _RERANK_UPSTREAM_SENSITIVITY)
     return {
         "trigger": trigger,
         "role": role,
@@ -1152,6 +1185,26 @@ def _weighted_rerank_core(
         + _REMED_RERANK_WEIGHT * float(comps["remed"])
     )
     return core
+
+
+_RERANK_NONLINEAR_SIGMOID_SCALE = 5.0
+_RERANK_NONLINEAR_SIGMOID_CENTER = 0.26
+_RERANK_NONLINEAR_SIGMOID_GAIN = 1.2
+
+
+def _rerank_core_linear_troup(comps: Mapping[str, float], wmap: Mapping[str, float] | None) -> float:
+    """Weighted trigger + role + upstream (propagation mass split out for structural_bonus)."""
+    m = _DEFAULT_RERANK_WEIGHTS if wmap is None else wmap
+    comps_z = dict(comps)
+    comps_z["propagation"] = 0.0
+    trigger_c, up_mass = _weighted_trigger_and_prop_upstream(comps_z, m)
+    return trigger_c + float(m["role"]) * float(comps["role"]) + up_mass
+
+
+def _rerank_nonlinear_sigmoid(x: float) -> float:
+    z = _RERANK_NONLINEAR_SIGMOID_SCALE * (float(x) - _RERANK_NONLINEAR_SIGMOID_CENTER)
+    z = max(-40.0, min(40.0, z))
+    return 1.0 / (1.0 + math.exp(-z))
 
 
 def _remediation_similarity(
@@ -1487,6 +1540,39 @@ def _negative_evidence_multiplier(
     return max(_NEGATIVE_EVIDENCE_FLOOR, m)
 
 
+_RECALL_RESCUE_PROP_FP_SIM_MIN = 0.8
+_RECALL_RESCUE_PROP_BONUS = 0.05
+_RECALL_RESCUE_ROLE_UPSTREAM_BONUS = 0.03
+_RECALL_RESCUE_REMED_SIM_MIN = 0.5
+_RECALL_RESCUE_REMED_BONUS = 0.04
+
+
+def _recall_rescue_flat_boost(
+    qfp: IncidentFingerprint,
+    cfp: IncidentFingerprint,
+    comps: Mapping[str, float],
+    prop_fp_sim: float,
+    *,
+    has_remediation_memory: bool,
+) -> float:
+    """Additive recall rescue (applied after multiplicative dampening, before final clip/sharpen).
+
+    Lifts near-true candidates so they survive ``min_score`` gates and compete in top-5.
+    """
+    b = 0.0
+    if float(prop_fp_sim) > _RECALL_RESCUE_PROP_FP_SIM_MIN:
+        b += _RECALL_RESCUE_PROP_BONUS
+    if (
+        qfp.affected_role == cfp.affected_role
+        and qfp.upstream_involved
+        and qfp.upstream_involved == cfp.upstream_involved
+    ):
+        b += _RECALL_RESCUE_ROLE_UPSTREAM_BONUS
+    if has_remediation_memory and float(comps.get("remed", 0.0)) >= _RECALL_RESCUE_REMED_SIM_MIN:
+        b += _RECALL_RESCUE_REMED_BONUS
+    return b
+
+
 def _rerank_introspection(
     qfp: IncidentFingerprint,
     qfeat: RetrievalFeatures,
@@ -1495,7 +1581,9 @@ def _rerank_introspection(
     ctx: RerankContext,
 ) -> RerankIntrospection:
     comps = rerank_component_values(qfp, qfeat, cfp, cfeat, ctx, idf_stats=ctx.idf_stats)
-    core_linear = _weighted_rerank_core(comps, ctx.rerank_weights)
+    nds = int(ctx.idf_stats.total_docs) if ctx.idf_stats else 0
+    wmap_eff = _DEFAULT_RERANK_WEIGHTS if ctx.rerank_weights is None else ctx.rerank_weights
+    core_linear = _rerank_core_linear_troup(comps, wmap_eff)
 
     deploy_pat = 0.0
     if qfeat.deploy_pattern and cfeat.deploy_pattern:
@@ -1521,6 +1609,10 @@ def _rerank_introspection(
         prop_fp_sim = 0.0
     else:
         prop_fp_sim = propagation_similarity(qpf, cpf)
+    if nds >= _RERANK_FULL_SENSITIVITY_MIN_DOCS:
+        prop_fp_adj = min(1.0, float(prop_fp_sim) * _RERANK_PROP_SENSITIVITY)
+    else:
+        prop_fp_adj = float(prop_fp_sim)
 
     alias_s = _alias_rerank_component(idn, qc, qfp, cfp, cfeat)
     behavioral = _behavioral_recurrence_bonus(qfp, qfeat, cfp, cfeat, ctx)
@@ -1566,25 +1658,54 @@ def _rerank_introspection(
         drift,
     )
 
-    pre_beh = (
-        core_linear
-        + _SEQUENCE_RERANK_WEIGHT * deploy_pat
+    m = wmap_eff
+    w_p = float(m["propagation"])
+    w_tm = float(m["temporal"])
+    struct_prop = w_p * float(comps["propagation"])
+    structural_bonus = (
+        struct_prop
+        + w_tm * float(comps["temporal"])
         + topology
-        + _PROPAGATION_FP_RERANK_WEIGHT * prop_fp_sim
+        + _SEQUENCE_RERANK_WEIGHT * deploy_pat
+        + _PROPAGATION_FP_RERANK_WEIGHT * prop_fp_adj
         + _ALIAS_RERANK_WEIGHT * alias_s
         + _TEMPORAL_SHAPE_RERANK_WEIGHT * tempo_shape
+        + _REMED_RERANK_WEIGHT * float(comps["remed"])
+        + hc_boost
     )
-    pre_beh *= rarity_factor
-    pre_beh *= neg_m
-    pre_beh *= generic_mult
-    pre_beh += hc_boost
-    total = min(1.0, pre_beh + behavioral + rec_prior)
+    sharp_core = _rerank_nonlinear_sigmoid(core_linear) * _RERANK_NONLINEAR_SIGMOID_GAIN
+    # Nonlinear core (sigmoid compression) + linear structural mass, then corpus dampening.
+    combined = sharp_core + structural_bonus
+    combined *= rarity_factor
+    combined *= neg_m
+    combined *= generic_mult
+    combined += behavioral + rec_prior
+    rescue = _recall_rescue_flat_boost(
+        qfp,
+        cfp,
+        comps,
+        prop_fp_sim,
+        has_remediation_memory=ctx.remediation_memory is not None,
+    )
+    raw_total = combined + rescue
+    clipped = min(1.0, max(0.0, raw_total))
+    if nds >= _RERANK_FULL_SENSITIVITY_MIN_DOCS:
+        exp = _RERANK_SCORE_SHARPEN_EXP
+        if clipped >= 1.0 - 1e-15:
+            total = 1.0
+        elif clipped <= 0.0:
+            total = 0.0
+        else:
+            # Ease toward 1 (gamma>1): widens margin vs low totals on large corpora.
+            total = min(1.0, 1.0 - (1.0 - clipped) ** exp)
+    else:
+        total = clipped
 
     return RerankIntrospection(
         total_score=total,
         trigger_score=float(comps["trigger"]),
         deploy_pattern_score=deploy_pat,
-        propagation_score=prop_fp_sim,
+        propagation_score=prop_fp_adj,
         topology_score=topology,
         upstream_score=float(comps["upstream"]),
         remediation_score=float(comps["remed"]),
@@ -1661,6 +1782,130 @@ def _ranking_spread_diagnostics(adjusted_scores: list[float]) -> dict[str, float
         "top1_top2_margin": t1t2,
         "near_tie_count_below_top1": int(near_tie),
     }
+
+
+# --- false-positive / redundancy dampening inside the diverse rerank pool (pre margin-cal) ---
+# Applied only when the pool has enough rows and the corpus is large enough (see _top_k_two_stage),
+# so tiny unit pools stay unchanged. Thresholds tune when 0.85 / 0.80 / 0.88 multipliers fire.
+
+_FP_COHERENCE_PROP_LOW = 0.28
+_FP_COHERENCE_TRIGGER_HIGH = 0.88
+_FP_COHERENCE_TRIG_PROP_MULT = 0.85
+_FP_COHERENCE_TOPO_HIGH = 0.22
+_FP_COHERENCE_UPSTREAM_LOW = 0.18
+_FP_COHERENCE_TOPO_UP_MULT = 0.80
+_FP_DIVERSITY_SAME_TRIGGER_DIFF_PROP_MULT = 0.88
+_FP_DIVERSITY_LOOKBACK = 12
+
+
+def _propagation_fp_diversity_key(p: PropagationFingerprint) -> tuple[Any, ...]:
+    """Stable tuple for comparing candidate cascade shape (rename-robust where possible)."""
+    return (
+        int(p.hop_count),
+        int(p.propagation_depth),
+        p.edge_type_seq_hash,
+        tuple(p.role_transitions),
+        tuple(p.edge_types[:32]) if p.edge_types else (),
+    )
+
+
+def _apply_rerank_pool_coherence_multiplier(intro: RerankIntrospection) -> float:
+    """Down-rank trigger-only or topology-only agreement without upstream support."""
+    m = 1.0
+    ps = float(intro.propagation_score)
+    ts = float(intro.trigger_score)
+    if ps < _FP_COHERENCE_PROP_LOW and ts >= _FP_COHERENCE_TRIGGER_HIGH:
+        m *= _FP_COHERENCE_TRIG_PROP_MULT
+    topo = float(intro.topology_score)
+    ups = float(intro.upstream_score)
+    if topo >= _FP_COHERENCE_TOPO_HIGH and ups < _FP_COHERENCE_UPSTREAM_LOW:
+        m *= _FP_COHERENCE_TOPO_UP_MULT
+    return m
+
+
+def _apply_reranked_fp_penalties(
+    rows: list[
+        tuple[float, str, IncidentFingerprint, RerankIntrospection, dict[str, float] | None, tuple[str, ...]]
+    ],
+    feat_by_iid: Mapping[str, RetrievalFeatures],
+) -> list[
+    tuple[float, str, IncidentFingerprint, RerankIntrospection, dict[str, float] | None, tuple[str, ...]]
+]:
+    """Coherence dampening then diversity vs higher-ranked pool rows (same trigger, different cascade)."""
+    if not rows:
+        return rows
+
+    def _sort_key(
+        row: tuple[float, str, IncidentFingerprint, RerankIntrospection, dict[str, float] | None, tuple[str, ...]],
+    ) -> tuple[Any, ...]:
+        _r, _iid, _fp, intro, _bd, _tags = row
+        return (
+            row[0],
+            intro.upstream_score,
+            intro.remediation_score,
+            intro.deploy_pattern_score,
+            intro.temporal_shape_similarity,
+            intro.negative_evidence_multiplier,
+            intro.rarity_factor,
+            intro.idf_deploy_shape,
+            intro.behavioral_recurrence,
+            intro.recurrence_prior,
+            intro.propagation_score,
+            intro.high_confidence_struct_boost,
+            intro.generic_feature_multiplier,
+            row[1],
+        )
+
+    coh: list[
+        tuple[float, str, IncidentFingerprint, RerankIntrospection, dict[str, float] | None, tuple[str, ...]]
+    ] = []
+    for row in rows:
+        r, iid, fp, intro, bd, tags = row
+        mult = _apply_rerank_pool_coherence_multiplier(intro)
+        nr = min(1.0, max(0.0, r * mult))
+        nintro = replace(intro, total_score=nr)
+        nbd = bd
+        if bd is not None:
+            nbd = {
+                **bd,
+                "rerank_score": nr,
+                "rerank_decomposition": nintro.as_public_dict(iid),
+            }
+        coh.append((nr, iid, fp, nintro, nbd, tags))
+    coh.sort(key=_sort_key, reverse=True)
+
+    out: list[
+        tuple[float, str, IncidentFingerprint, RerankIntrospection, dict[str, float] | None, tuple[str, ...]]
+    ] = []
+    for i, row in enumerate(coh):
+        r, iid, fp, intro, bd, tags = row
+        mult = 1.0
+        pfi = feat_by_iid.get(iid)
+        if pfi is not None:
+            key_i = _propagation_fp_diversity_key(pfi.propagation_fingerprint)
+            tri_i = normalize_trigger(fp.trigger_type)
+            for j in range(max(0, i - _FP_DIVERSITY_LOOKBACK), i):
+                _rj, jid, fpj, _, _, _ = coh[j]
+                if normalize_trigger(fpj.trigger_type) != tri_i:
+                    continue
+                pfc = feat_by_iid.get(jid)
+                if pfc is None:
+                    continue
+                if key_i != _propagation_fp_diversity_key(pfc.propagation_fingerprint):
+                    mult *= _FP_DIVERSITY_SAME_TRIGGER_DIFF_PROP_MULT
+                    break
+        nr = min(1.0, max(0.0, r * mult))
+        nintro = replace(intro, total_score=nr)
+        nbd = bd
+        if bd is not None:
+            nbd = {
+                **bd,
+                "rerank_score": nr,
+                "rerank_decomposition": nintro.as_public_dict(iid),
+            }
+        out.append((nr, iid, fp, nintro, nbd, tags))
+    out.sort(key=_sort_key, reverse=True)
+    return out
 
 
 def rerank_score_breakdown(
@@ -2693,6 +2938,11 @@ class FingerprintMatcher:
         diverse_count = len(diverse_indices)
         self._last_pool_stats = {"raw_union": raw_count, "diverse_pool": diverse_count}
 
+        feat_by_iid: dict[str, RetrievalFeatures] = {}
+        for idx in diverse_indices:
+            iid, _fp, _ctx, cfeat = self._corpus[idx]
+            feat_by_iid[iid] = cfeat
+
         pool_rank_by_id: dict[str, int] = {}
         for pool_pos, idx in enumerate(diverse_indices, start=1):
             pool_incident_id, _cfp, _cctx, _cfeat = self._corpus[idx]
@@ -2773,6 +3023,9 @@ class FingerprintMatcher:
             ),
             reverse=True,
         )
+        nd_pool = int(rctx_score.idf_stats.total_docs) if rctx_score.idf_stats else 0
+        if len(reranked) >= 6 and nd_pool >= 20:
+            reranked = _apply_reranked_fp_penalties(reranked, feat_by_iid)
         scores = [row[0] for row in reranked]
         rarity = [row[3].rarity_factor for row in reranked]
         gen_mult = [row[3].generic_feature_multiplier for row in reranked]
@@ -3005,20 +3258,26 @@ def _two_stage_match_explain_row(
     propagation_total = prop_edges_c + prop_path
     temporal_total = temporal_deploy_c + tempo_shape
 
-    pre_additive = (
-        intro.core_linear
-        + deploy_seq
-        + topo
+    cr = intro.core_linear
+    sharp_core = _rerank_nonlinear_sigmoid(cr) * _RERANK_NONLINEAR_SIGMOID_GAIN
+    structural_bonus = (
+        prop_edges_c
         + prop_path
-        + alias_r
+        + temporal_deploy_c
         + tempo_shape
+        + topo
+        + deploy_seq
+        + alias_r
+        + remed_c
+        + intro.high_confidence_struct_boost
     )
+    pre_additive = sharp_core + structural_bonus
     scale = (
         intro.rarity_factor
         * intro.negative_evidence_multiplier
         * intro.generic_feature_multiplier
     )
-    pre_after_scale = pre_additive * scale + intro.high_confidence_struct_boost
+    pre_after_scale = pre_additive * scale + intro.behavioral_recurrence + intro.recurrence_prior
 
     contrib_for_sort: dict[str, float] = {
         "trigger_core": trigger_c,
