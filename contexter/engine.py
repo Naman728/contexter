@@ -133,6 +133,8 @@ class Engine:
         self._substrate.register_router("metric", self._on_metric)
         self._substrate.register_router("log", self._on_log)
         self._substrate.register_router("trace", self._on_trace)
+        self._substrate.register_router("topology", self._on_topology)
+        self._substrate.register_router("identity.drift", self._on_drift)
         self._substrate.register_router("incident_signal", self._on_incident_signal)
         self._substrate.register_router("remediation", self._on_remediation)
 
@@ -187,6 +189,31 @@ class Engine:
                 self._substrate.identity,
             ):
                 self._causal_graph.dependency_graph.add_call_edge(caller, callee)
+        except Exception:
+            return
+
+    def _on_topology(self, event: Event, canonical: str) -> None:
+        try:
+            payload = event.payload or {}
+            change = str(payload.get("change", ""))
+            a = str(payload.get("from_", ""))
+            b = str(payload.get("to", payload.get("to_", "")))
+            if change == "dep_add":
+                self._causal_graph.dependency_graph.add_call_edge(a, b)
+            elif change == "dep_remove":
+                self._causal_graph.dependency_graph.remove_call_edge(a, b)
+        except Exception:
+            return
+
+    def _on_drift(self, event: Event, canonical: str) -> None:
+        try:
+            payload = event.payload or {}
+            old = str(payload.get("from_", ""))
+            new = str(payload.get("to", payload.get("to_", "")))
+            if old and new:
+                self._substrate.identity.union(
+                    old, new, occurred_at=event.occurred_at_utc()
+                )
         except Exception:
             return
 

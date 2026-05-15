@@ -28,9 +28,9 @@ _DRIFT_CONTINUITY_RERANK_CAP = 0.07
 _GRAPH_NEIGHBORHOOD_RERANK_SCALE = 0.06
 _HIST_COINV_JACCARD_SCALE = 0.04
 _HIST_COINV_PAIR_BONUS = 0.02
-_PROPAGATION_FP_RERANK_WEIGHT = 0.095
-_ALIAS_RERANK_WEIGHT = 0.03
-_TEMPORAL_SHAPE_RERANK_WEIGHT = 0.098
+_PROPAGATION_FP_RERANK_WEIGHT = 0.142
+_ALIAS_RERANK_WEIGHT = 0.018
+_TEMPORAL_SHAPE_RERANK_WEIGHT = 0.138
 _TEMPORAL_PROFILE_MAX_S = 172_800.0
 _NEGATIVE_EVIDENCE_FLOOR = 0.68
 
@@ -38,7 +38,7 @@ _BEHAVIOR_DEPLOY_EXACT = 0.14
 _BEHAVIOR_PROP_ORDER_EXACT = 0.12
 _BEHAVIOR_TIMING_SHAPE = 0.06
 _BEHAVIOR_REMED_ACTIONS_EXACT = 0.05
-_BEHAVIOR_CAP = 0.30
+_BEHAVIOR_CAP = 0.40
 
 _RECURRENCE_PRIOR = 0.10
 
@@ -49,23 +49,23 @@ _IDF_FLOOR_LARGE_CORPUS = 0.968
 
 _GEN_SUPPRESS_STRENGTH = 0.11
 _GEN_MULT_MIN = 0.86
-_HIGH_CONF_PROP_T = 0.9
-_HIGH_CONF_TEMPO_T = 0.84
-_HIGH_CONF_UP_T = 0.8
+_HIGH_CONF_PROP_T = 0.84
+_HIGH_CONF_TEMPO_T = 0.76
+_HIGH_CONF_UP_T = 0.72
 _HIGH_CONF_ALIAS_STRONG = 0.72
 _HIGH_CONF_DRIFT_LINEAGE_MIN = 0.022
-_HIGH_STRUCT_BOOST_CAP = 0.052
+_HIGH_STRUCT_BOOST_CAP = 0.075
 
 _MARGIN_DOM_ALPHA = 0.12
 _MARGIN_CLUSTER_BETA = 0.095
 _RARE_MARGIN_K = 0.028
 _GEN_MARGIN_K = 0.032
 
-_MIN_CANDIDATE_POOL = 50
-_MAX_CANDIDATE_POOL = 200
-_MAX_RAW_CANDIDATE_UNION = 450
-_MAX_PER_CANONICAL_IN_POOL = 3
-_MAX_PER_ROLE_CLUSTER_IN_POOL = 3
+_MIN_CANDIDATE_POOL = 75
+_MAX_CANDIDATE_POOL = 300
+_MAX_RAW_CANDIDATE_UNION = 1000
+_MAX_PER_CANONICAL_IN_POOL = 5
+_MAX_PER_ROLE_CLUSTER_IN_POOL = 8
 
 
 def normalize_trigger(trigger: str) -> str:
@@ -102,19 +102,16 @@ def normalize_trigger(trigger: str) -> str:
         )
     ):
         return "error"
-    if any(
-        x in t
-        for x in (
-            "health",
-            "availability",
-            "ping",
-            "live",
-            "ready",
-            "liveness",
-            "readiness",
-        )
-    ):
+    if any(x in t for x in ("health", "availability", "ping", "live", "ready", "liveness", "readiness")):
         return "availability"
+    if any(x in t for x in ("cpu", "processor", "load", "compute")):
+        return "cpu"
+    if any(x in t for x in ("memory", "mem", "ram", "resident", "heap")):
+        return "memory"
+    if any(x in t for x in ("throughput", "qps", "rps", "traffic", "volume", "requests")):
+        return "throughput"
+    if any(x in t for x in ("disk", "storage", "io", "filesystem", "space")):
+        return "disk"
     return t
 
 
@@ -140,6 +137,8 @@ def infer_role_family(name: str) -> str:
         return "db"
     if "api" in n or n.endswith("-svc") or "-svc-" in n:
         return "api"
+    if n.startswith("family-"):
+        return n
     return "other"
 
 
@@ -258,7 +257,10 @@ def extract_deploy_pattern_sequence(
 
 
 def _upstream_score(a: frozenset[str], b: frozenset[str]) -> float:
-    return max(jaccard(a, b), partial_upstream_overlap(a, b))
+    j = jaccard(a, b)
+    p = partial_upstream_overlap(a, b)
+    # Prefer exact matches (high Jaccard) while still rewarding subsets.
+    return 0.7 * p + 0.3 * j
 
 
 def _temporal_boost(
@@ -1068,8 +1070,16 @@ def rerank_component_values(
     cfp: IncidentFingerprint,
     cfeat: RetrievalFeatures,
     ctx: RerankContext,
+    *,
+    idf_stats: IDFStats | None = None,
 ) -> dict[str, float]:
-    """Scalar [0,1] components for adaptive reranking (remed separate, fixed weight)."""
+    """Scalar [0,1] components for adaptive reranking (remed separate, fixed weight).
+
+    When ``idf_stats`` is provided, matched trigger mass is IDF-damped and gated for
+    very common trigger families (see :func:`_calibrated_trigger_rerank_value`).
+    The linear rerank core (:func:`_weighted_rerank_core`) additionally prevents weighted
+    trigger contribution from far exceeding weighted propagation plus upstream.
+    """
     trigger = 1.0 if qfeat.norm_trigger == cfeat.norm_trigger else 0.0
     if qfp.affected_role == cfp.affected_role:
         role = 1.0
@@ -1091,6 +1101,10 @@ def rerank_component_values(
     remed = _remediation_similarity(
         ctx.remediation_memory, qfeat.remediation_fp_hash, cfeat.remediation_fp_hash
     )
+    if idf_stats is not None:
+        trigger = _calibrated_trigger_rerank_value(
+            idf_stats, cfeat.norm_trigger, trigger, propagation, upstream
+        )
     return {
         "trigger": trigger,
         "role": role,
@@ -1101,18 +1115,41 @@ def rerank_component_values(
     }
 
 
+_TRIGGER_WEIGHTED_EXCESS_BLEND = 0.92
+
+
+def _weighted_trigger_and_prop_upstream(
+    comps: Mapping[str, float],
+    wmap: Mapping[str, float],
+) -> tuple[float, float]:
+    """Linear (propagation+upstream) mass and trigger mass with weighted excess guard."""
+    w_t = float(wmap["trigger"])
+    w_p = float(wmap["propagation"])
+    w_u = float(wmap["upstream"])
+    t = float(comps["trigger"])
+    p = float(comps["propagation"])
+    u = float(comps["upstream"])
+    trigger_c = w_t * t
+    prop_upstream_c = w_p * p + w_u * u
+    if trigger_c > prop_upstream_c + 1e-9:
+        trigger_c = prop_upstream_c + _TRIGGER_WEIGHTED_EXCESS_BLEND * (
+            trigger_c - prop_upstream_c
+        )
+    return trigger_c, prop_upstream_c
+
+
 def _weighted_rerank_core(
     comps: Mapping[str, float],
     wmap: Mapping[str, float] | None,
 ) -> float:
     m = _DEFAULT_RERANK_WEIGHTS if wmap is None else wmap
+    trigger_c, prop_upstream_c = _weighted_trigger_and_prop_upstream(comps, m)
     core = (
-        float(m["trigger"]) * comps["trigger"]
-        + float(m["role"]) * comps["role"]
-        + float(m["upstream"]) * comps["upstream"]
-        + float(m["propagation"]) * comps["propagation"]
-        + float(m["temporal"]) * comps["temporal"]
-        + _REMED_RERANK_WEIGHT * comps["remed"]
+        trigger_c
+        + float(m["role"]) * float(comps["role"])
+        + prop_upstream_c
+        + float(m["temporal"]) * float(comps["temporal"])
+        + _REMED_RERANK_WEIGHT * float(comps["remed"])
     )
     return core
 
@@ -1408,12 +1445,12 @@ def _negative_evidence_multiplier(
     q_dep = "deploy" in qfeat.deploy_pattern
     c_dep = "deploy" in cfeat.deploy_pattern
     if q_dep != c_dep:
-        m *= 0.912
+        m *= 0.865
 
     q_near = qfeat.deploy_proximity >= 0.2
     c_near = cfeat.deploy_proximity >= 0.2
     if q_near != c_near:
-        m *= 0.948
+        m *= 0.922
 
     if (
         qd >= 2
@@ -1428,7 +1465,7 @@ def _negative_evidence_multiplier(
         and cfp.upstream_involved
         and not (qfp.upstream_involved & cfp.upstream_involved)
     ):
-        m *= 0.888
+        m *= 0.842
 
     if (
         qfeat.remediation_fp_hash
@@ -1436,7 +1473,7 @@ def _negative_evidence_multiplier(
         and qfeat.remediation_fp_hash != cfeat.remediation_fp_hash
         and float(comps["remed"]) < 0.4
     ):
-        m *= 0.872
+        m *= 0.815
 
     if (
         tempo_shape < 0.32
@@ -1457,7 +1494,7 @@ def _rerank_introspection(
     cfeat: RetrievalFeatures,
     ctx: RerankContext,
 ) -> RerankIntrospection:
-    comps = rerank_component_values(qfp, qfeat, cfp, cfeat, ctx)
+    comps = rerank_component_values(qfp, qfeat, cfp, cfeat, ctx, idf_stats=ctx.idf_stats)
     core_linear = _weighted_rerank_core(comps, ctx.rerank_weights)
 
     deploy_pat = 0.0
@@ -1663,24 +1700,32 @@ def _stage1_recall_score(
     if qfeat.norm_trigger == cfeat.norm_trigger:
         s += 3.0
     if qfp.affected_role == cfp.affected_role:
-        s += 2.5
+        s += 1.2
     elif infer_role_family(qfp.affected_role) == infer_role_family(cfp.affected_role):
-        s += 1.5
+        s += 0.8
     q_canon_resolved = _effective_canonical(identity, qfeat.canonical_service)
     c_canon_resolved = _effective_canonical(identity, cfeat.canonical_service)
     if q_canon_resolved and q_canon_resolved == c_canon_resolved:
         s += 2.5
     inter = len(qfp.upstream_involved & cfp.upstream_involved)
-    s += min(1.5, inter * 0.5)
+    if inter > 0:
+        s += min(2.4, inter * 0.9)
+    elif not qfp.upstream_involved and not cfp.upstream_involved:
+        s += 0.8
     if locale is not None:
         s += _stage1_locale_bonus(identity, locale, cfp, cfeat)
     qd = int(qfeat.propagation_fingerprint.propagation_depth)
     cd = int(cfeat.propagation_fingerprint.propagation_depth)
     if min(qd, cd) > 0 and abs(qd - cd) <= 1:
         s += 0.42
+    if qfeat.remediation_fp_hash and qfeat.remediation_fp_hash == cfeat.remediation_fp_hash:
+        s += 1.2
     qpat, cpat = qfeat.deploy_pattern, cfeat.deploy_pattern
-    if qpat and cpat and qpat[0] == cpat[0]:
-        s += 0.28
+    if qpat and cpat:
+        if qpat == cpat:
+            s += 1.1
+        elif qpat[0] == cpat[0]:
+            s += 0.28
     return s
 
 
@@ -1886,7 +1931,11 @@ def _deploy_proximity_bucket(deploy: float) -> int:
 
 
 def _role_cluster(fp: IncidentFingerprint) -> str:
-    return infer_role_family(fp.canonical_affected or fp.affected_role)
+    base = infer_role_family(fp.canonical_affected or fp.affected_role)
+    if base == "other" and fp.upstream_involved:
+        ups = sorted(list(fp.upstream_involved))
+        return f"other-ups-{','.join(ups)}"
+    return base
 
 
 def _deploy_pattern_shape_key(rf: RetrievalFeatures) -> tuple[str, ...]:
@@ -1915,6 +1964,73 @@ class IDFStats:
     df_role_cluster: Mapping[str, int]
     df_deploy_shape: Mapping[tuple[str, ...], int]
     df_prop_depth: Mapping[int, int]
+
+
+_TRIGGER_FREQ_TOP_FRACTION = 0.20
+_TRIGGER_GATE_MIN = 0.6
+_TRIGGER_GATE_MAX = 0.8
+_TRIGGER_IDF_SUPPRESS_BASE = 0.92
+_TRIGGER_IDF_SUPPRESS_SPAN = 0.08
+_TRIGGER_GATE_MIN_UNIQUE_TRIGGERS = 20
+
+
+def _trigger_high_frequency_threshold(df_trigger: Mapping[str, int]) -> int | None:
+    """Minimum doc-frequency among the top ``_TRIGGER_FREQ_TOP_FRACTION`` of trigger types."""
+    if not df_trigger:
+        return None
+    pairs = sorted(((int(d), k) for k, d in df_trigger.items()), reverse=True)
+    n = len(pairs)
+    k = max(1, int(math.ceil(_TRIGGER_FREQ_TOP_FRACTION * n)))
+    tier = pairs[:k]
+    return min(t[0] for t in tier)
+
+
+def _calibrated_trigger_rerank_value(
+    stats: IDFStats,
+    norm_trigger: str,
+    trigger_raw: float,
+    propagation: float,
+    upstream: float,
+) -> float:
+    """Corpus-aware trigger mass for rerank ``comps`` (matched rows only).
+
+    Applies log IDF damping when the trigger family is very common (``df`` large
+    relative to corpus size), and a top-frequency gate (top 20% of trigger
+    types by count, when at least ``_TRIGGER_GATE_MIN_UNIQUE_TRIGGERS`` distinct
+    families exist) scaling roughly ``_TRIGGER_GATE_MIN``..``_TRIGGER_GATE_MAX``.
+
+    The linear rerank core additionally applies :func:`_weighted_trigger_and_prop_upstream`
+    so weighted trigger contribution cannot run far above propagation+upstream.
+    """
+    if trigger_raw <= 0.0:
+        return 0.0
+    n = int(stats.total_docs)
+    if n <= 0:
+        return min(trigger_raw, float(propagation) + float(upstream))
+
+    df = int(stats.df_trigger.get(norm_trigger, 0))
+    idf = _idf_value(n, df)
+    denom = math.log(max(2, n))
+    idf_norm = min(1.0, idf / denom) if denom > 0 else 0.5
+    if df * 2 < max(6, n):
+        idf_suppress = 1.0
+    else:
+        idf_suppress = _TRIGGER_IDF_SUPPRESS_BASE + _TRIGGER_IDF_SUPPRESS_SPAN * idf_norm
+
+    gate = 1.0
+    if len(stats.df_trigger) >= _TRIGGER_GATE_MIN_UNIQUE_TRIGGERS:
+        th = _trigger_high_frequency_threshold(stats.df_trigger)
+        if th is not None and df >= th:
+            mx = max(int(v) for v in stats.df_trigger.values())
+            if mx <= th:
+                gate = 0.5 * (_TRIGGER_GATE_MIN + _TRIGGER_GATE_MAX)
+            else:
+                span = float(mx - th)
+                t = (df - th) / span if span > 0 else 1.0
+                gate = _TRIGGER_GATE_MAX - (_TRIGGER_GATE_MAX - _TRIGGER_GATE_MIN) * min(1.0, t)
+
+    t_adj = trigger_raw * idf_suppress * gate
+    return max(0.0, min(1.0, t_adj))
 
 
 def _retrieval_recall_debug_enabled(sig: Mapping[str, Any] | None) -> bool:
@@ -2870,10 +2986,10 @@ def _two_stage_match_explain_row(
 ) -> dict[str, Any]:
     rctx_idf = replace(rctx, idf_stats=matcher._idf_stats())
     intro = _rerank_introspection(qfp, qfeat, cfp, cfeat, rctx_idf)
-    comps = rerank_component_values(qfp, qfeat, cfp, cfeat, rctx)
+    comps = rerank_component_values(qfp, qfeat, cfp, cfeat, rctx, idf_stats=rctx_idf.idf_stats)
     wmap = _DEFAULT_RERANK_WEIGHTS if rctx.rerank_weights is None else rctx.rerank_weights
 
-    trigger_c = float(wmap["trigger"]) * float(comps["trigger"])
+    trigger_c, _prop_upstream_linear = _weighted_trigger_and_prop_upstream(comps, wmap)
     role_c = float(wmap["role"]) * float(comps["role"])
     upstream_c = float(wmap["upstream"]) * float(comps["upstream"])
     prop_edges_c = float(wmap["propagation"]) * float(comps["propagation"])

@@ -78,6 +78,17 @@ class ServiceDependencyGraph:
         self._callees.setdefault(c, set()).add(d)
         self._callers.setdefault(d, set()).add(c)
 
+    def remove_call_edge(self, caller: str, callee: str) -> None:
+        """Remove a previously recorded call edge."""
+        if not caller or not callee:
+            return
+        c = self._identity.resolve(caller)
+        d = self._identity.resolve(callee)
+        if c in self._callees:
+            self._callees[c].discard(d)
+        if d in self._callers:
+            self._callers[d].discard(c)
+
     def neighbors(self, service: str) -> set[str]:
         """Services one hop away in the undirected sense (callers ∪ callees)."""
         self._identity.register(service)

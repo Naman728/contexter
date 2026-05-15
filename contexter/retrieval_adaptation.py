@@ -40,11 +40,11 @@ _SNAPSHOT_VERSION = 1
 
 def _default_weight_map() -> dict[str, float]:
     return {
-        "trigger": 0.33,
-        "role": 0.11,
-        "upstream": 0.20,
-        "propagation": 0.065,
-        "temporal": 0.085,
+        "trigger": 0.35,
+        "role": 0.08,
+        "upstream": 0.22,
+        "propagation": 0.12,
+        "temporal": 0.08,
     }
 
 
@@ -151,8 +151,9 @@ class RetrievalAdaptation:
             rf = _features_for_incident(matcher, m.incident_id)
             if rf is None:
                 continue
+            idf = _matcher_idf_stats(matcher)
             vals = rerank_component_values(
-                query_fp, query_features, m.fingerprint, rf, rerank_ctx
+                query_fp, query_features, m.fingerprint, rf, rerank_ctx, idf_stats=idf
             )
             for k in _COMPONENT_KEYS:
                 max_by_dim[k] = max(max_by_dim[k], vals[k])
@@ -210,8 +211,14 @@ class RetrievalAdaptation:
             if winner is not None:
                 rf_win = _features_for_incident(matcher, winner.incident_id)
                 if rf_win is not None:
+                    idf = _matcher_idf_stats(matcher)
                     vals = rerank_component_values(
-                        query_fp, query_features, winner.fingerprint, rf_win, rerank_ctx
+                        query_fp,
+                        query_features,
+                        winner.fingerprint,
+                        rf_win,
+                        rerank_ctx,
+                        idf_stats=idf,
                     )
                     ssum = sum(max(vals[k], 1e-6) for k in _COMPONENT_KEYS)
                     target = {
@@ -344,6 +351,16 @@ class RetrievalAdaptation:
                         continue
 
 
+def _matcher_idf_stats(matcher: Any):
+    try:
+        fn = getattr(matcher, "_idf_stats", None)
+        if callable(fn):
+            return fn()
+    except Exception:
+        return None
+    return None
+
+
 def _vals_for_match(
     matcher: Any,
     query_fp: IncidentFingerprint,
@@ -355,7 +372,12 @@ def _vals_for_match(
     if rf is None:
         return None
     return rerank_component_values(
-        query_fp, query_features, m.fingerprint, rf, rerank_ctx
+        query_fp,
+        query_features,
+        m.fingerprint,
+        rf,
+        rerank_ctx,
+        idf_stats=_matcher_idf_stats(matcher),
     )
 
 

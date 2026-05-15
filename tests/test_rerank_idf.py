@@ -9,6 +9,7 @@ from contexter.incident_fingerprint import (
     RerankContext,
     RetrievalFeatures,
     normalize_trigger,
+    rerank_component_values,
 )
 from contexter.remediation_memory import RemediationMemory
 
@@ -107,3 +108,26 @@ def test_rare_propagation_depth_outranks_common_shallow_noise() -> None:
     ranked = matcher.top_k(query_fp, k=5, rerank_context=rctx, two_stage=True)
     assert ranked[0].incident_id == "deep-1"
     assert ranked[0].score >= ranked[1].score
+
+
+def test_matched_trigger_scalar_downweighted_for_dominant_trigger_family() -> None:
+    """With corpus IDF, identical coarse triggers contribute less than a raw 1.0 match."""
+    mem = RemediationMemory()
+    matcher = FingerprintMatcher(remediation_memory=mem)
+    pat = ("deploy", "latency")
+    prop = _EMPTY_PROP
+    for i in range(26):
+        fp = IncidentFingerprint("latency", f"svc-{i}", frozenset(), f"svc-{i}")
+        matcher.index(str(i), fp, {}, retrieval_features=_rf(fp=fp, deploy_pattern=pat, prop_fp=prop))
+
+    idf = matcher._idf_stats()
+    qfp = IncidentFingerprint("latency", "svc-0", frozenset(), "svc-0")
+    qfeat = _rf(fp=qfp, deploy_pattern=pat, prop_fp=prop)
+    cand_fp = IncidentFingerprint("latency", "svc-1", frozenset(), "svc-1")
+    cfeat = _rf(fp=cand_fp, deploy_pattern=pat, prop_fp=prop)
+    rctx = RerankContext(query_features=qfeat, remediation_memory=mem)
+
+    raw = rerank_component_values(qfp, qfeat, cand_fp, cfeat, rctx, idf_stats=None)
+    adj = rerank_component_values(qfp, qfeat, cand_fp, cfeat, rctx, idf_stats=idf)
+    assert raw["trigger"] == 1.0
+    assert adj["trigger"] < raw["trigger"]
