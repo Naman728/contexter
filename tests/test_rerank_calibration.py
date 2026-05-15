@@ -8,6 +8,7 @@ from contexter.incident_fingerprint import (
     PropagationFingerprint,
     RerankContext,
     RetrievalFeatures,
+    TemporalProfile,
     normalize_trigger,
     rerank_score_breakdown,
 )
@@ -71,9 +72,123 @@ def test_rerank_decomposition_has_contract_keys() -> None:
         "generic_feature_multiplier",
         "high_confidence_struct_boost",
         "margin_calibration_delta",
+        "false_positive_suppress_multiplier",
+        "separation_sharpen",
     ):
         assert key in d
     assert d["incident_id"] == "INC-X"
+
+
+def test_false_positive_suppress_gate_trigger_only_weak_core() -> None:
+    """Low core propagation+upstream with strong capped trigger applies 0.75 pre-clip mass."""
+    mem = RemediationMemory()
+    empty_prop = PropagationFingerprint((), (), (), 0, 0)
+    qfp = IncidentFingerprint("latency", "checkout-api", frozenset({"dep-q"}), "checkout-api")
+    cfp = IncidentFingerprint("latency", "checkout-api", frozenset({"dep-c"}), "checkout-api")
+    qf = RetrievalFeatures(
+        normalize_trigger(qfp.trigger_type),
+        qfp.affected_role,
+        qfp.canonical_affected,
+        qfp.upstream_involved,
+        deploy_proximity=0.4,
+        causal_edge_count=12,
+        propagation_edge_count=12,
+        remediation_fp_hash="hq",
+        deploy_pattern=(),
+        propagation_fingerprint=empty_prop,
+        temporal_profile=TemporalProfile.missing(),
+    )
+    cf_weak = RetrievalFeatures(
+        normalize_trigger(cfp.trigger_type),
+        cfp.affected_role,
+        cfp.canonical_affected,
+        cfp.upstream_involved,
+        deploy_proximity=0.4,
+        causal_edge_count=0,
+        propagation_edge_count=0,
+        remediation_fp_hash="hc",
+        deploy_pattern=(),
+        propagation_fingerprint=empty_prop,
+        temporal_profile=TemporalProfile.missing(),
+    )
+    ctx = RerankContext(query_features=qf, remediation_memory=mem)
+    d = rerank_score_breakdown(qfp, qf, cfp, cf_weak, ctx, incident_id="INC-X")
+    assert d["false_positive_suppress_multiplier"] == 0.75
+    assert d["trigger_score"] >= 0.12
+
+    cf_strong = RetrievalFeatures(
+        normalize_trigger(cfp.trigger_type),
+        cfp.affected_role,
+        cfp.canonical_affected,
+        cfp.upstream_involved,
+        deploy_proximity=0.4,
+        causal_edge_count=12,
+        propagation_edge_count=12,
+        remediation_fp_hash="hc",
+        deploy_pattern=(),
+        propagation_fingerprint=empty_prop,
+        temporal_profile=TemporalProfile.missing(),
+    )
+    d2 = rerank_score_breakdown(qfp, qf, cfp, cf_strong, ctx, incident_id="INC-Y")
+    assert d2["false_positive_suppress_multiplier"] == 1.0
+
+
+def test_topology_rerank_capped_and_requires_propagation_path() -> None:
+    """Dense graph overlap does not add topology mass unless propagation fingerprint path > 0.3."""
+    mem = RemediationMemory()
+    empty_prop = PropagationFingerprint((), (), (), 0, 0)
+    deep_prop = PropagationFingerprint(
+        degradation_order=("redis", "checkout-api", "frontend"),
+        edge_types=("metric", "metric"),
+        propagation_hops=(1, 1),
+        hop_count=2,
+        propagation_depth=2,
+    )
+
+    class _DenseGraph:
+        __slots__ = ()
+
+        def neighbors(self, root: str) -> set[str]:
+            return {"hub", "mesh", "edge", root}
+
+    graph = _DenseGraph()
+    qfp = IncidentFingerprint("p99_latency", "checkout-api", frozenset({"redis"}), "checkout-api")
+    c_other = IncidentFingerprint("p99_latency", "other-api", frozenset(), "other-api")
+    c_twin = IncidentFingerprint("p99_latency", "checkout-api", frozenset({"redis"}), "checkout-api")
+
+    def _feat(fp: IncidentFingerprint, prop: PropagationFingerprint, deploy: float) -> RetrievalFeatures:
+        return RetrievalFeatures(
+            normalize_trigger(fp.trigger_type),
+            fp.affected_role,
+            fp.canonical_affected,
+            fp.upstream_involved,
+            deploy_proximity=deploy,
+            causal_edge_count=4,
+            propagation_edge_count=2,
+            remediation_fp_hash="",
+            deploy_pattern=(),
+            propagation_fingerprint=prop,
+            temporal_profile=TemporalProfile.missing(),
+        )
+
+    qf = _feat(qfp, deep_prop, 0.9)
+    ctx = RerankContext(
+        query_features=qf,
+        remediation_memory=mem,
+        dependency_graph=graph,
+        query_canonical="checkout-api",
+    )
+
+    d_graph_only = rerank_score_breakdown(
+        qfp, qf, c_other, _feat(c_other, empty_prop, 0.9), ctx, incident_id="INC-A"
+    )
+    assert d_graph_only["topology_score"] == 0.0
+
+    d_path = rerank_score_breakdown(
+        qfp, qf, c_twin, _feat(c_twin, deep_prop, 0.9), ctx, incident_id="INC-B"
+    )
+    assert 0.0 < d_path["topology_score"] <= 0.12
+    assert d_path["propagation_score"] > 0.3
 
 
 def test_behavioral_recurrence_beats_topology_only_distractors() -> None:

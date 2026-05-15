@@ -28,6 +28,9 @@ _DRIFT_CONTINUITY_RERANK_CAP = 0.07
 _GRAPH_NEIGHBORHOOD_RERANK_SCALE = 0.06
 _HIST_COINV_JACCARD_SCALE = 0.04
 _HIST_COINV_PAIR_BONUS = 0.02
+# Neighbor / drift / history mass: cap and require propagation-path agreement (reduces graph-only FPs).
+_RERANK_TOPOLOGY_SCORE_CAP = 0.12
+_RERANK_TOPOLOGY_REQUIRES_PROP_FP_ABOVE = 0.3
 _PROPAGATION_FP_RERANK_WEIGHT = 0.142
 _ALIAS_RERANK_WEIGHT = 0.018
 _TEMPORAL_SHAPE_RERANK_WEIGHT = 0.138
@@ -1060,6 +1063,10 @@ _RERANK_TRIGGER_IDF_MASS_CAP = 1.08
 # Below this corpus size, skip structural amplification / extra trigger IDF (tests, tiny pools).
 _RERANK_FULL_SENSITIVITY_MIN_DOCS = 8
 _RERANK_TRIGGER_IDF_MASS_MIN_DOCS = 15
+# Bounded trigger mass + high-frequency dampening (reduces FP inflation).
+_RERANK_TRIGGER_SCORE_CAP = 0.18
+_RERANK_TRIGGER_RAW_IDF_HALF_THRESHOLD = 0.38
+_RERANK_TRIGGER_STRUCT_GATE = 0.2
 
 
 def _rerank_trigger_idf_mass_multiplier(stats: IDFStats | None, norm_trigger: str) -> float:
@@ -1106,6 +1113,10 @@ def rerank_component_values(
     very common trigger families (see :func:`_calibrated_trigger_rerank_value`).
     The linear rerank core (:func:`_weighted_rerank_core`) additionally prevents weighted
     trigger contribution from far exceeding weighted propagation plus upstream.
+
+    Trigger mass is capped (``_RERANK_TRIGGER_SCORE_CAP``), halved when raw trigger IDF
+    is below :data:`_RERANK_TRIGGER_RAW_IDF_HALF_THRESHOLD`, and zeroed when corpus IDF
+    is available and neither propagation nor upstream exceeds :data:`_RERANK_TRIGGER_STRUCT_GATE`.
     """
     trigger = 1.0 if qfeat.norm_trigger == cfeat.norm_trigger else 0.0
     if qfp.affected_role == cfp.affected_role:
@@ -1138,6 +1149,16 @@ def rerank_component_values(
     if nd >= _RERANK_FULL_SENSITIVITY_MIN_DOCS:
         propagation = min(1.0, float(propagation) * _RERANK_PROP_SENSITIVITY)
         upstream = min(1.0, float(upstream) * _RERANK_UPSTREAM_SENSITIVITY)
+    trigger = max(0.0, min(_RERANK_TRIGGER_SCORE_CAP, float(trigger)))
+    if idf_stats is not None and idf_stats.total_docs > 0:
+        n_doc = int(idf_stats.total_docs)
+        df_tr = int(idf_stats.df_trigger.get(cfeat.norm_trigger, 0))
+        raw_idf = _idf_value(n_doc, df_tr)
+        if raw_idf < _RERANK_TRIGGER_RAW_IDF_HALF_THRESHOLD:
+            trigger *= 0.5
+    if max(float(propagation), float(upstream)) <= _RERANK_TRIGGER_STRUCT_GATE + 1e-15:
+        if idf_stats is not None:
+            trigger = 0.0
     return {
         "trigger": trigger,
         "role": role,
@@ -1190,10 +1211,11 @@ def _weighted_rerank_core(
 _RERANK_NONLINEAR_SIGMOID_SCALE = 5.0
 _RERANK_NONLINEAR_SIGMOID_CENTER = 0.26
 _RERANK_NONLINEAR_SIGMOID_GAIN = 1.2
+_RERANK_SCORE_SEP_TANH_GAIN = 0.15
 
 
 def _rerank_core_linear_troup(comps: Mapping[str, float], wmap: Mapping[str, float] | None) -> float:
-    """Weighted trigger + role + upstream (propagation mass split out for structural_bonus)."""
+    """Weighted trigger + role + upstream (propagation mass split out for separation tanh)."""
     m = _DEFAULT_RERANK_WEIGHTS if wmap is None else wmap
     comps_z = dict(comps)
     comps_z["propagation"] = 0.0
@@ -1251,6 +1273,8 @@ class RerankIntrospection:
     generic_feature_multiplier: float = 1.0
     high_confidence_struct_boost: float = 0.0
     margin_calibration_delta: float = 0.0
+    false_positive_suppress_multiplier: float = 1.0
+    separation_sharpen: float = 0.0
 
     def as_public_dict(self, incident_id: str) -> dict[str, Any]:
         return {
@@ -1278,6 +1302,8 @@ class RerankIntrospection:
             "generic_feature_multiplier": self.generic_feature_multiplier,
             "high_confidence_struct_boost": self.high_confidence_struct_boost,
             "margin_calibration_delta": self.margin_calibration_delta,
+            "false_positive_suppress_multiplier": self.false_positive_suppress_multiplier,
+            "separation_sharpen": self.separation_sharpen,
         }
 
 
@@ -1595,15 +1621,6 @@ def _rerank_introspection(
     qroot = _effective_canonical(idn, qc) if qc else ""
     croot = _effective_canonical(idn, cname) if cname else ""
 
-    drift = _drift_continuity_rerank(idn, qfp, cfp)
-    graph_bonus = _graph_neighborhood_overlap_rerank(
-        ctx.dependency_graph, idn, qroot, croot
-    )
-    hist_bonus = _historical_neighborhood_rerank(
-        ctx.neighborhood_memory, idn, qroot, croot
-    )
-    topology = drift + graph_bonus + hist_bonus
-
     qpf, cpf = qfeat.propagation_fingerprint, cfeat.propagation_fingerprint
     if qpf.hop_count == 0 and cpf.hop_count == 0:
         prop_fp_sim = 0.0
@@ -1613,6 +1630,18 @@ def _rerank_introspection(
         prop_fp_adj = min(1.0, float(prop_fp_sim) * _RERANK_PROP_SENSITIVITY)
     else:
         prop_fp_adj = float(prop_fp_sim)
+
+    drift = _drift_continuity_rerank(idn, qfp, cfp)
+    graph_bonus = _graph_neighborhood_overlap_rerank(
+        ctx.dependency_graph, idn, qroot, croot
+    )
+    hist_bonus = _historical_neighborhood_rerank(
+        ctx.neighborhood_memory, idn, qroot, croot
+    )
+    topology_raw = drift + graph_bonus + hist_bonus
+    topology = min(float(topology_raw), _RERANK_TOPOLOGY_SCORE_CAP)
+    if prop_fp_adj <= _RERANK_TOPOLOGY_REQUIRES_PROP_FP_ABOVE:
+        topology = 0.0
 
     alias_s = _alias_rerank_component(idn, qc, qfp, cfp, cfeat)
     behavioral = _behavioral_recurrence_bonus(qfp, qfeat, cfp, cfeat, ctx)
@@ -1660,7 +1689,9 @@ def _rerank_introspection(
 
     m = wmap_eff
     w_p = float(m["propagation"])
+    w_u = float(m["upstream"])
     w_tm = float(m["temporal"])
+    w_t = float(m["trigger"])
     struct_prop = w_p * float(comps["propagation"])
     structural_bonus = (
         struct_prop
@@ -1673,13 +1704,30 @@ def _rerank_introspection(
         + _REMED_RERANK_WEIGHT * float(comps["remed"])
         + hc_boost
     )
+    structural_align = (
+        struct_prop
+        + w_u * float(comps["upstream"])
+        + w_tm * float(comps["temporal"])
+        + _PROPAGATION_FP_RERANK_WEIGHT * prop_fp_adj
+    )
+    fp_noise_estimate = w_t * float(comps["trigger"]) + topology
+    z_sep = structural_align - fp_noise_estimate
+    z_sep = max(-20.0, min(20.0, z_sep))
+    separation_sharpen = _RERANK_SCORE_SEP_TANH_GAIN * math.tanh(z_sep)
     sharp_core = _rerank_nonlinear_sigmoid(core_linear) * _RERANK_NONLINEAR_SIGMOID_GAIN
-    # Nonlinear core (sigmoid compression) + linear structural mass, then corpus dampening.
-    combined = sharp_core + structural_bonus
+    # Full structural mass (unchanged) + bounded tanh(prop+upstream+temp+path − trigger − topology).
+    combined = sharp_core + structural_bonus + separation_sharpen
     combined *= rarity_factor
     combined *= neg_m
     combined *= generic_mult
     combined += behavioral + rec_prior
+    fp_sup = 1.0
+    if (
+        float(comps["propagation"]) < _FP_SUPPRESS_CORE_PROP_UP_LOW
+        and float(comps["upstream"]) < _FP_SUPPRESS_CORE_PROP_UP_LOW
+        and float(comps["trigger"]) >= _FP_SUPPRESS_TRIGGER_HIGH
+    ):
+        fp_sup = _FP_SUPPRESS_GLOBAL_MULT
     rescue = _recall_rescue_flat_boost(
         qfp,
         cfp,
@@ -1687,7 +1735,7 @@ def _rerank_introspection(
         prop_fp_sim,
         has_remediation_memory=ctx.remediation_memory is not None,
     )
-    raw_total = combined + rescue
+    raw_total = (combined + rescue) * fp_sup
     clipped = min(1.0, max(0.0, raw_total))
     if nds >= _RERANK_FULL_SENSITIVITY_MIN_DOCS:
         exp = _RERANK_SCORE_SHARPEN_EXP
@@ -1725,6 +1773,8 @@ def _rerank_introspection(
         generic_feature_multiplier=generic_mult,
         high_confidence_struct_boost=hc_boost,
         margin_calibration_delta=0.0,
+        false_positive_suppress_multiplier=fp_sup,
+        separation_sharpen=separation_sharpen,
     )
 
 
@@ -1794,6 +1844,11 @@ _FP_COHERENCE_TRIG_PROP_MULT = 0.85
 _FP_COHERENCE_TOPO_HIGH = 0.22
 _FP_COHERENCE_UPSTREAM_LOW = 0.18
 _FP_COHERENCE_TOPO_UP_MULT = 0.80
+
+# Trigger-only FP suppression (core propagation/upstream both weak, trigger still high).
+_FP_SUPPRESS_CORE_PROP_UP_LOW = 0.25
+_FP_SUPPRESS_TRIGGER_HIGH = 0.12  # on capped trigger mass scale (~0.18 max)
+_FP_SUPPRESS_GLOBAL_MULT = 0.75
 _FP_DIVERSITY_SAME_TRIGGER_DIFF_PROP_MULT = 0.88
 _FP_DIVERSITY_LOOKBACK = 12
 
@@ -3271,7 +3326,11 @@ def _two_stage_match_explain_row(
         + remed_c
         + intro.high_confidence_struct_boost
     )
-    pre_additive = sharp_core + structural_bonus
+    structural_align = prop_edges_c + upstream_c + temporal_deploy_c + prop_path
+    fp_noise_est = float(wmap["trigger"]) * float(comps["trigger"]) + topo
+    z_s = max(-20.0, min(20.0, structural_align - fp_noise_est))
+    sep = _RERANK_SCORE_SEP_TANH_GAIN * math.tanh(z_s)
+    pre_additive = sharp_core + structural_bonus + sep
     scale = (
         intro.rarity_factor
         * intro.negative_evidence_multiplier
@@ -3291,6 +3350,7 @@ def _two_stage_match_explain_row(
         "deploy_sequence_rerank": deploy_seq,
         "topology_rerank": topo,
         "alias_rerank": alias_r,
+        "separation_sharpen": sep,
         "behavioral_recurrence": intro.behavioral_recurrence,
         "recurrence_prior": intro.recurrence_prior,
     }

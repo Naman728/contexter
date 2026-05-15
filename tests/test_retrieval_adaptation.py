@@ -279,4 +279,4 @@ def test_rerank_component_values_contract() -> None:
     rem = RemediationMemory()
     ctx = RerankContext(query_features=qf, remediation_memory=rem)
     v = rerank_component_values(qfp, qf, cfp, cf, ctx)
-    assert v["trigger"] == 1.0 and v["upstream"] == 1.0
+    assert v["trigger"] == 0.18 and v["upstream"] == 1.0

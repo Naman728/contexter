@@ -129,5 +129,5 @@ def test_matched_trigger_scalar_downweighted_for_dominant_trigger_family() -> No
 
     raw = rerank_component_values(qfp, qfeat, cand_fp, cfeat, rctx, idf_stats=None)
     adj = rerank_component_values(qfp, qfeat, cand_fp, cfeat, rctx, idf_stats=idf)
-    assert raw["trigger"] == 1.0
+    assert raw["trigger"] == 0.18
     assert adj["trigger"] < raw["trigger"]
